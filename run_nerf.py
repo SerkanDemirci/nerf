@@ -15,7 +15,7 @@ from load_blender import load_blender_data
 
 
 tf.compat.v1.enable_eager_execution()
-
+ 
 
 def batchify(fn, chunk):
     """Constructs a version of 'fn' that applies to smaller batches."""
@@ -238,7 +238,8 @@ def render_rays(ray_batch,
         ret['z_std'] = tf.math.reduce_std(z_samples, -1)  # [N_rays]
 
     for k in ret:
-        tf.debugging.check_numerics(ret[k], 'output {}'.format(k))
+        if k != 'disp0' and k != 'disp_map':
+            tf.debugging.check_numerics(ret[k], 'output {}'.format(k))
 
     return ret
 
@@ -349,6 +350,9 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
     rgbs = []
     disps = []
 
+    if summary:
+        psnrs = []
+
     t = time.time()
     for i, c2w in enumerate(render_poses):
         print(i, time.time() - t)
@@ -364,6 +368,9 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
             p = -10. * np.log10(np.mean(np.square(rgb - gt_imgs[i])))
             print(p)
 
+            if summary:
+                psnrs.append(d)
+        
         if savedir is not None:
             rgb8 = to8b(rgbs[-1])
             filename = os.path.join(savedir, '{:03d}.png'.format(i))
@@ -371,6 +378,10 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
 
     rgbs = np.stack(rgbs, 0)
     disps = np.stack(disps, 0)
+
+    if summary:
+        tf.summary.scalar('test_psnr_avg', np.mean(psnrs))
+        tf.summary.scalar('test_psnr_std', np.std(psnrs))
 
     return rgbs, disps
 
@@ -391,6 +402,10 @@ def create_nerf(args):
         D=args.netdepth, W=args.netwidth,
         input_ch=input_ch, output_ch=output_ch, skips=skips,
         input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
+
+    print("\n\n\n{0}MODEL:{0}\n\n\n".format("=" * 30))
+    print(model.summary())
+
     grad_vars = model.trainable_variables
     models = {'model': model}
 
@@ -402,6 +417,9 @@ def create_nerf(args):
             input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
         grad_vars += model_fine.trainable_variables
         models['model_fine'] = model_fine
+        print("\n\n\n{0}FINE MODEL:{0}\n\n\n".format("=" * 30))
+        print(model_fine.summary())
+
 
     def network_query_fn(inputs, viewdirs, network_fn): return run_network(
         inputs, viewdirs, network_fn,
@@ -568,6 +586,10 @@ def config_parser():
                         help='frequency of testset saving')
     parser.add_argument("--i_video",   type=int, default=50000,
                         help='frequency of render_poses video saving')
+
+    # My args
+    parser.add_argument("--N_iters", type=int, default=50000, 
+                        help="Number of iterations to train")
 
     return parser
 
@@ -743,16 +765,18 @@ def train():
         print('done')
         i_batch = 0
 
-    N_iters = 1000000
+    N_iters = args.N_iters + 1
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
     print('VAL views are', i_val)
 
     # Summary writers
-    writer = tf.contrib.summary.create_file_writer(
+
+    writer = tf.summary.create_file_writer(
         os.path.join(basedir, 'summaries', expname))
-    writer.set_as_default()
+    #writer.set_as_default()
+
 
     for i in range(start, N_iters):
         time0 = time.time()
@@ -842,7 +866,7 @@ def train():
             for k in models:
                 save_weights(models[k], k, i)
 
-        if i % args.i_video == 0 and i > 0:
+        if (i % args.i_video == 0 or i == N_iters - 1) and i > 0:
 
             rgbs, disps = render_path(
                 render_poses, hwf, args.chunk, render_kwargs_test)
@@ -867,20 +891,21 @@ def train():
                 basedir, expname, 'testset_{:06d}'.format(i))
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
-            render_path(poses[i_test], hwf, args.chunk, render_kwargs_test,
-                        gt_imgs=images[i_test], savedir=testsavedir)
+            with writer.as_default(i):
+                render_path(poses[i_test], hwf, args.chunk, render_kwargs_test,
+                            gt_imgs=images[i_test], savedir=testsavedir, save_summary=True)
             print('Saved test set')
 
         if i % args.i_print == 0 or i < 10:
 
             print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
             print('iter time {:.05f}'.format(dt))
-            with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
-                tf.contrib.summary.scalar('loss', loss)
-                tf.contrib.summary.scalar('psnr', psnr)
-                tf.contrib.summary.histogram('tran', trans)
+            with writer.as_default(i):
+                tf.summary.scalar('loss', loss)
+                tf.summary.scalar('psnr', psnr)
+                tf.summary.histogram('tran', trans)
                 if args.N_importance > 0:
-                    tf.contrib.summary.scalar('psnr0', psnr0)
+                    tf.summary.scalar('psnr0', psnr0)
 
             if i % args.i_img == 0:
 
@@ -900,25 +925,25 @@ def train():
                     os.makedirs(testimgdir, exist_ok=True)
                 imageio.imwrite(os.path.join(testimgdir, '{:06d}.png'.format(i)), to8b(rgb))
 
-                with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
+                with writer.as_default(i):
 
-                    tf.contrib.summary.image('rgb', to8b(rgb)[tf.newaxis])
-                    tf.contrib.summary.image(
+                    tf.summary.image('rgb', to8b(rgb)[tf.newaxis])
+                    tf.summary.image(
                         'disp', disp[tf.newaxis, ..., tf.newaxis])
-                    tf.contrib.summary.image(
+                    tf.summary.image(
                         'acc', acc[tf.newaxis, ..., tf.newaxis])
 
-                    tf.contrib.summary.scalar('psnr_holdout', psnr)
-                    tf.contrib.summary.image('rgb_holdout', target[tf.newaxis])
+                    tf.summary.scalar('psnr_holdout', psnr)
+                    tf.summary.image('rgb_holdout', target[tf.newaxis])
 
                 if args.N_importance > 0:
 
-                    with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-                        tf.contrib.summary.image(
+                    with writer.as_default(i):
+                        tf.summary.image(
                             'rgb0', to8b(extras['rgb0'])[tf.newaxis])
-                        tf.contrib.summary.image(
+                        tf.summary.image(
                             'disp0', extras['disp0'][tf.newaxis, ..., tf.newaxis])
-                        tf.contrib.summary.image(
+                        tf.summary.image(
                             'z_std', extras['z_std'][tf.newaxis, ..., tf.newaxis])
 
         global_step.assign_add(1)
