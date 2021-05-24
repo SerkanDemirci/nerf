@@ -1,6 +1,6 @@
 # Improving NeRF: Neural Radiance Fields
 ### Bilkent University
-[CS 555](http://www.cs.bilkent.edu.tr/~sedat/CS484_555/index.html) - Introduction to Computer Vision Course Project
+[CS 555 - Introduction to Computer Vision Course Project]((http://www.cs.bilkent.edu.tr/~sedat/CS484_555/index.html))
 
 Spring 2021 
 
@@ -12,7 +12,7 @@ Experimented 3 methods  to improve the NeRF model.
 Original NeRF project page: http://tancik.com/nerf
 
 
-My implementation of three methods to improve NeRF.
+My implementation of three methods to improve NeRF:
 
 ## Methods Implemented
 
@@ -52,15 +52,13 @@ bash download_example_data.sh
 Full dataset can be found in: https://drive.google.com/drive/folders/128yBriW1IG_3NJ5Rp7APSTZsJqdJdfc1
 
 
-Run,
+To train the default NeRF architecture run,
 
 ```
 python run_nerf.py --config project_configs/fern_nerf_config.txt
 ```
 
-to train the default NeRF architecture. 
-
-For the three methods described implemented in the project, change the --config argument with the following:
+For the three methods implemented in the project, change the --config argument with the following:
 
 * project_configs/fern_grid_res_config.txt for Grid-NeRF residual method,
 * project_configs/fern_embeddings_config.txt for Grid Embeddings method,
