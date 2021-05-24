@@ -1,0 +1,28 @@
+expname = fern_nerf
+basedir = ./logs
+datadir = ./data/nerf_llff_data/fern
+dataset_type = llff
+
+factor = 8
+llffhold = 8
+
+use_viewdirs = True
+
+no_batching = False
+#lrate_decay = 25
+#raw_noise_std = 1.0
+
+N_samples = 64
+N_importance = 128
+
+N_rand = 512
+chunk= 512 
+
+N_iters = 10000
+i_testset = 2500
+i_video = 10000
+
+no_reload=True
+
+model=default
+optimizer=adam

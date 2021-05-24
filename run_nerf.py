@@ -13,9 +13,17 @@ from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 
+from tensorflow_addons.optimizers import CyclicalLearningRate
+
 
 tf.compat.v1.enable_eager_execution()
  
+physical_devices = tf.config.list_physical_devices('GPU')
+try:
+  tf.config.experimental.set_memory_growth(physical_devices[0], True)
+except:
+  # Invalid device or cannot modify virtual devices once initialized.
+  pass
 
 def batchify(fn, chunk):
     """Constructs a version of 'fn' that applies to smaller batches."""
@@ -27,7 +35,7 @@ def batchify(fn, chunk):
     return ret
 
 
-def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
+def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, dists=None, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'."""
 
     inputs_flat = tf.reshape(inputs, [-1, inputs.shape[-1]])
@@ -37,7 +45,11 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
         input_dirs = tf.broadcast_to(viewdirs[:, None], inputs.shape)
         input_dirs_flat = tf.reshape(input_dirs, [-1, input_dirs.shape[-1]])
         embedded_dirs = embeddirs_fn(input_dirs_flat)
+
         embedded = tf.concat([embedded, embedded_dirs], -1)
+
+    if dists is not None:
+        embedded = tf.concat([embedded, dists], -1)
 
     outputs_flat = batchify(fn, netchunk)(embedded)
     outputs = tf.reshape(outputs_flat, list(
@@ -203,7 +215,19 @@ def render_rays(ray_batch,
         z_vals[..., :, None]  # [N_rays, N_samples, 3]
 
     # Evaluate model at each point.
-    raw = network_query_fn(pts, viewdirs, network_fn)  # [N_rays, N_samples, 4]
+
+    dists = z_vals[..., 1:] - z_vals[..., :-1]
+    # The 'distance' from the last integration time is infinity.
+    dists = tf.concat(
+        [dists, tf.broadcast_to([1e10], dists[..., :1].shape)],
+        axis=-1)  # [N_rays, N_samples]
+
+    # Multiply each distance by the norm of its corresponding direction ray
+    # to convert to real world distance (accounts for non-unit directions).
+    dists = dists * tf.linalg.norm(rays_d[..., None, :], axis=-1)
+
+    flat_dists = tf.reshape(dists, [-1, 1])
+    raw = network_query_fn(pts, viewdirs, network_fn, dists=flat_dists)  # [N_rays, N_samples, 4]
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
         raw, z_vals, rays_d)
 
@@ -222,9 +246,21 @@ def render_rays(ray_batch,
         pts = rays_o[..., None, :] + rays_d[..., None, :] * \
             z_vals[..., :, None]  # [N_rays, N_samples + N_importance, 3]
 
+        dists = z_vals[..., 1:] - z_vals[..., :-1]
+        # The 'distance' from the last integration time is infinity.
+        dists = tf.concat(
+            [dists, tf.broadcast_to([1e10], dists[..., :1].shape)],
+            axis=-1)  # [N_rays, N_samples]
+
+        # Multiply each distance by the norm of its corresponding direction ray
+        # to convert to real world distance (accounts for non-unit directions).
+        dists = dists * tf.linalg.norm(rays_d[..., None, :], axis=-1)
+
+        flat_dists = tf.reshape(dists, [-1, 1])
+
         # Make predictions with network_fine.
         run_fn = network_fn if network_fine is None else network_fine
-        raw = network_query_fn(pts, viewdirs, run_fn)
+        raw = network_query_fn(pts, viewdirs, run_fn, dists=flat_dists)
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
             raw, z_vals, rays_d)
 
@@ -304,6 +340,7 @@ def render(H, W, focal,
 
         # Make all directions unit magnitude.
         # shape: [batch_size, 3]
+        dists = tf.linalg.norm(viewdirs, axis=-1, keepdims=True)
         viewdirs = viewdirs / tf.linalg.norm(viewdirs, axis=-1, keepdims=True)
         viewdirs = tf.cast(tf.reshape(viewdirs, [-1, 3]), dtype=tf.float32)
 
@@ -325,6 +362,7 @@ def render(H, W, focal,
         # (ray origin, ray direction, min dist, max dist, normalized viewing direction)
         rays = tf.concat([rays, viewdirs], axis=-1)
 
+    #rays = tf.concat([rays, ], -1)
     # Render and reshape
     all_ret = batchify_rays(rays, chunk, **kwargs)
     for k in all_ret:
@@ -337,7 +375,7 @@ def render(H, W, focal,
     return ret_list + [ret_dict]
 
 
-def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0):
+def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0, save_summary=False):
 
     H, W, focal = hwf
 
@@ -350,7 +388,7 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
     rgbs = []
     disps = []
 
-    if summary:
+    if save_summary:
         psnrs = []
 
     t = time.time()
@@ -368,8 +406,8 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
             p = -10. * np.log10(np.mean(np.square(rgb - gt_imgs[i])))
             print(p)
 
-            if summary:
-                psnrs.append(d)
+            if save_summary:
+                psnrs.append(p)
         
         if savedir is not None:
             rgb8 = to8b(rgbs[-1])
@@ -379,7 +417,7 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
     rgbs = np.stack(rgbs, 0)
     disps = np.stack(disps, 0)
 
-    if summary:
+    if save_summary:
         tf.summary.scalar('test_psnr_avg', np.mean(psnrs))
         tf.summary.scalar('test_psnr_std', np.std(psnrs))
 
@@ -398,10 +436,10 @@ def create_nerf(args):
             args.multires_views, args.i_embed)
     output_ch = 4
     skips = [4]
-    model = init_nerf_model(
+    model, _ = init_nerf_model(
         D=args.netdepth, W=args.netwidth,
         input_ch=input_ch, output_ch=output_ch, skips=skips,
-        input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
+        input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs, args=args, embed_fn=embed_fn)
 
     print("\n\n\n{0}MODEL:{0}\n\n\n".format("=" * 30))
     print(model.summary())
@@ -411,21 +449,21 @@ def create_nerf(args):
 
     model_fine = None
     if args.N_importance > 0:
-        model_fine = init_nerf_model(
+        model_fine, model_fine2 = init_nerf_model(
             D=args.netdepth_fine, W=args.netwidth_fine,
             input_ch=input_ch, output_ch=output_ch, skips=skips,
-            input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
+            input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs, fine_model=True, args=args, embed_fn=embed_fn)
         grad_vars += model_fine.trainable_variables
         models['model_fine'] = model_fine
         print("\n\n\n{0}FINE MODEL:{0}\n\n\n".format("=" * 30))
         print(model_fine.summary())
 
 
-    def network_query_fn(inputs, viewdirs, network_fn): return run_network(
+    def network_query_fn(inputs, viewdirs, network_fn, dists=None): return run_network(
         inputs, viewdirs, network_fn,
         embed_fn=embed_fn,
         embeddirs_fn=embeddirs_fn,
-        netchunk=args.netchunk)
+        netchunk=args.netchunk, dists=dists)
 
     render_kwargs_train = {
         'network_query_fn': network_query_fn,
@@ -591,8 +629,51 @@ def config_parser():
     parser.add_argument("--N_iters", type=int, default=50000, 
                         help="Number of iterations to train")
 
+    parser.add_argument("--save_vid", action='store_true', 
+                        help="Save vid at the end")
+
+    parser.add_argument("--model", choices=['default', 'grid_res', 'grid_first', 'grid_only', 'fourier'], 
+                        help="Args for grid")
+
+    parser.add_argument("--model_extra", choices=['default', 'transform'], 
+                        help="Args for grid")
+
+
+    parser.add_argument("--optimizer", choices=['adam', 'cyclic'], 
+                        help="Optimizer")
+    
+
     return parser
 
+
+class CyclicLR:
+    def __init__(self):
+        self.max_lr = 5e-4 * 4
+        self.min_lr = 5e-4
+        self.freq = 25
+        self.max_decay = 0.005
+        self.min_decay = 0.0001
+        self.epochs = 0
+        self.steps = 8
+
+    def __call__(self):
+        self.epochs = self.epochs + 1
+        s = (2 * np.pi) / self.freq
+
+        l = np.cos(s * self.epochs) * 0.5 + 0.5
+        #l = np.round(l * self.steps) / self.steps
+        l = l ** 2
+        lr = (1 - l) * self.min_lr + (l) * self.max_lr
+
+        self.max_lr -= self.max_decay * self.max_lr
+        self.min_lr -= self.min_decay * self.min_lr
+
+        self.max_lr = max(self.max_lr, self.min_lr)
+        self.min_lr = min(self.max_lr, self.min_lr)
+
+        if self.epochs % 100 == 0:
+            print("Cycle: ", " L:", l, " LR: ", lr)
+        return lr
 
 def train():
 
@@ -728,7 +809,23 @@ def train():
     if args.lrate_decay > 0:
         lrate = tf.keras.optimizers.schedules.ExponentialDecay(lrate,
                                                                decay_steps=args.lrate_decay * 1000, decay_rate=0.1)
-    optimizer = tf.keras.optimizers.Adam(lrate)
+    if args.optimizer == "adam":
+        optimizer = tf.keras.optimizers.Adam(lrate)
+    elif args.optimizer == "cyclic":
+        #optimizer = tf.keras.optimizers.Nadam(CyclicLR(), beta_1=0.5)
+
+        cyclical_learning_rate = CyclicalLearningRate(
+        initial_learning_rate=5e-4,
+        maximal_learning_rate=3e-5,
+        step_size=50,
+        scale_fn=lambda x: 1 / (2.0 ** (x - 1)),
+        scale_mode='cycle')
+
+        optimizer = tf.keras.optimizers.Adam(cyclical_learning_rate, beta_1=0.95)
+        
+
+        print("USING CYCLIC")
+
     models['optimizer'] = optimizer
 
     global_step = tf.compat.v1.train.get_or_create_global_step()
@@ -866,7 +963,7 @@ def train():
             for k in models:
                 save_weights(models[k], k, i)
 
-        if (i % args.i_video == 0 or i == N_iters - 1) and i > 0:
+        if (i % args.i_video == 0 or (args.save_vid and i == N_iters - 1)) and i > 0:
 
             rgbs, disps = render_path(
                 render_poses, hwf, args.chunk, render_kwargs_test)
@@ -886,7 +983,7 @@ def train():
                 imageio.mimwrite(moviebase + 'rgb_still.mp4',
                                  to8b(rgbs_still), fps=30, quality=8)
 
-        if i % args.i_testset == 0 and i > 0:
+        if (i % args.i_testset == 0) or (i == N_iters - 1):
             testsavedir = os.path.join(
                 basedir, expname, 'testset_{:06d}'.format(i))
             os.makedirs(testsavedir, exist_ok=True)
@@ -898,7 +995,7 @@ def train():
 
         if i % args.i_print == 0 or i < 10:
 
-            print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
+            print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy(), optimizer.lr, optimizer._decayed_lr(tf.float32).numpy())
             print('iter time {:.05f}'.format(dt))
             with writer.as_default(i):
                 tf.summary.scalar('loss', loss)

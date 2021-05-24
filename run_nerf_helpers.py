@@ -5,6 +5,10 @@ import numpy as np
 import imageio
 import json
 
+from tensorflow.python.keras.utils import layer_utils
+
+import utils.layers as util_layers
+
 
 # Misc utils
 
@@ -77,30 +81,97 @@ def get_embedder(multires, i=0):
 
 # Model architecture
 
-def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
+def init_nerf_model(
+    D               = 8,
+    W               = 256,
+    input_ch        = 3,
+    input_ch_views  = 3,
+    output_ch       = 4,
+    skips           = [4],
+    use_viewdirs    = False,
+    fine_model      = False,
+    args            = None,
+    embed_fn        = lambda x: x
+    ):
 
     relu = tf.keras.layers.ReLU()
     def dense(W, act=relu): return tf.keras.layers.Dense(W, activation=act)
 
     print('MODEL', input_ch, input_ch_views, type(
         input_ch), type(input_ch_views), use_viewdirs)
+    print("MODEL: ", args.model)
     input_ch = int(input_ch)
     input_ch_views = int(input_ch_views)
 
-    inputs = tf.keras.Input(shape=(input_ch + input_ch_views))
-    inputs_pts, inputs_views = tf.split(inputs, [input_ch, input_ch_views], -1)
+    inputs = tf.keras.Input(shape=(input_ch + input_ch_views + 1))
+    inputs_pts, inputs_views, dists = tf.split(inputs, [input_ch, input_ch_views, 1], -1)
     inputs_pts.set_shape([None, input_ch])
     inputs_views.set_shape([None, input_ch_views])
+    dists.set_shape([None, 1])
 
     print(inputs.shape, inputs_pts.shape, inputs_views.shape)
+
+    print("Inputs PTS:", inputs_pts.shape)
+
+    if args.model == "grid_only":
+        nbins = 32 
+        grid_out_dims = 4
+        transform = args.model_extra == "transform"
+        
+        bounds = tf.constant([[-2, -2, -2], [2, 2, 2]], dtype=tf.float32)
+
+        grid_encoding = util_layers.GridEncoding3D(nbins, grid_out_dims, bounds = bounds, transform=transform)    
+        encoded_pts = grid_encoding(inputs_pts[..., 0:3])
+    
+        model = tf.keras.Model(inputs=inputs, outputs=encoded_pts)
+        return model, model
+
+    if args.model.startswith('grid'):
+        nbins = 8 if args.model != 'grid_res' else 16
+        grid_out_dims = 4 if args.model == "grid_res" else 16
+        
+        
+        bounds = tf.constant([[-2, -2, -2], [2, 2, 2]], dtype=tf.float32)
+        interp = args.model != "grid_first"
+
+        transform = args.model_extra == "transform"
+        print(args.model, transform, " GRID RES?")
+        grid_encoding = util_layers.GridEncoding3D(nbins, grid_out_dims, bounds = bounds, transform=transform, interp=interp)    
+        encoded_pts = grid_encoding(inputs_pts[..., 0:3])
+    
+    if args.model == "grid_first":
+        inputs_pts = tf.concat((inputs_pts, encoded_pts), -1)
+
+    print("Inputs PTS:", inputs_pts.shape)
     outputs = inputs_pts
+
+    if args.model == "fourier":
+        D -= 1
+
     for i in range(D):
         outputs = dense(W)(outputs)
+
         if i in skips:
             outputs = tf.concat([inputs_pts, outputs], -1)
 
+    
+    if args.model == "fourier":
+        K = 32
+        c = tf.constant([2 * (i) for i in range(K)], dtype=tf.float32)
+
     if use_viewdirs:
-        alpha_out = dense(1, act=None)(outputs)
+        alpha_out = outputs
+        if args.model == "fourier":
+            a0 = dense(1, act=None)(outputs)
+            w = c * dense(K, act=None)(outputs)
+            a = dense(K, act=None)(outputs)
+            phi = dense(K, act=None)(outputs)
+
+            alpha_out = tf.concat([a0, a * tf.cos(w * dists + phi)], axis=-1)
+        
+        alpha_out = dense(1, act=None)(alpha_out)
+        
+        
         bottleneck = dense(256, act=None)(outputs)
         inputs_viewdirs = tf.concat(
             [bottleneck, inputs_views], -1)  # concat viewdirs
@@ -109,17 +180,25 @@ def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips
         # the experiments were actually run with 1 hidden layer, so we will leave it as 1.
         for i in range(1):
             outputs = dense(W//2)(outputs)
-        outputs = dense(3, act=None)(outputs)
-        outputs = tf.concat([outputs, alpha_out], -1)
+        
+        rgb_out = dense(3, act=None)(outputs)
+        outputs = tf.concat([rgb_out, alpha_out], -1)
     else:
         outputs = dense(output_ch, act=None)(outputs)
 
+    if args.model == "grid_res" or (args.model == "grid_coarse_only" and fine_model == False):
+        outputs = outputs + encoded_pts
+
     model = tf.keras.Model(inputs=inputs, outputs=outputs)
-    return model
+
+    model2 = model
+    if args.model == "grid_res" or (args.model == "grid_coarse_only" and fine_model == False):
+        model2 = tf.keras.Model(inputs=inputs, outputs=encoded_pts)
+    
+    return model, model2
 
 
 # Ray helpers
-
 def get_rays(H, W, focal, c2w):
     """Get ray origins, directions from a pinhole camera."""
     i, j = tf.meshgrid(tf.range(W, dtype=tf.float32),
