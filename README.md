@@ -11,6 +11,25 @@ Experimented 3 methods  to improve the NeRF model.
 
 Original NeRF project page: http://tancik.com/nerf
 
+
+My implementation of three methods to improve NeRF.
+
+## Methods Implemented
+
+### Grid-NeRF Residual
+
+<img src="imgs/res.png" alt="fourier architecture" width="700"/>
+
+
+### Grid Embeddings
+
+
+<img src="imgs/emb.png" alt="fourier architecture" width="400"/>
+
+### Fourier Nerf
+
+<img src="imgs/fourier.png" alt="fourier architecture" width="700"/>
+
 ## Setup
 
 Python 3 dependencies:
